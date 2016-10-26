@@ -25,11 +25,14 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hive.ql.io.orc.OrcInputFormat;
 import org.apache.hadoop.hive.ql.io.sarg.SearchArgument;
 import org.apache.hadoop.hive.ql.io.sarg.SearchArgumentFactory;
+import org.apache.hadoop.hive.serde2.io.DateWritable;
 import org.apache.hawq.pxf.api.BasicFilter;
 import org.apache.hawq.pxf.api.LogicalFilter;
 import org.apache.hawq.pxf.api.utilities.ColumnDescriptor;
 import org.apache.hawq.pxf.api.utilities.InputData;
 import org.apache.commons.lang.StringUtils;
+
+import java.sql.Date;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -158,9 +161,14 @@ public class HiveORCAccessor extends HiveAccessor {
         /* The below functions will not be compatible and requires update  with Hive 2.0 APIs */
         BasicFilter filter = (BasicFilter) filterObj;
         int filterColumnIndex = filter.getColumn().index();
-        Object filterValue = filter.getConstant().constant();
+        // filter value might be null for unary operations
+        Object filterValue = filter.getConstant() == null ? null : filter.getConstant().constant();
         ColumnDescriptor filterColumn = inputData.getColumn(filterColumnIndex);
         String filterColumnName = filterColumn.columnName();
+
+        /* Need to convert java.sql.Date to Hive's DateWritable Format */
+        if (filterValue instanceof Date)
+            filterValue= new DateWritable((Date) filterValue);
 
         switch(filter.getOperation()) {
             case HDOP_LT:
@@ -180,6 +188,12 @@ public class HiveORCAccessor extends HiveAccessor {
                 break;
             case HDOP_NE:
                 builder.startNot().equals(filterColumnName, filterValue).end();
+                break;
+            case HDOP_IS_NULL:
+                builder.isNull(filterColumnName);
+                break;
+            case HDOP_IS_NOT_NULL:
+                builder.startNot().isNull(filterColumnName).end();
                 break;
             default: {
                 LOG.debug("Filter push-down is not supported for " + filter.getOperation() + "operation.");
