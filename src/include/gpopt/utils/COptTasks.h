@@ -114,6 +114,10 @@ class COptTasks
 			// ctor
 			SOptContext();
 
+			// If there is an error print as warning and throw exception to abort
+			// plan generation
+			void HandleError(BOOL *pfUnexpectedFailure);
+
 			// free all members except input and output pointers
 			void Free(EPin epinInput, EPin epinOutput);
 
@@ -178,6 +182,10 @@ class COptTasks
 		// execute a task given the argument
 		static
 		void Execute ( void *(*pfunc) (void *), void *pfuncArg);
+
+		// print error and delete the given error buffer
+		static
+		void LogErrorAndDelete(CHAR* err_buf);
 
 		// task that does the translation from xml to dxl to pplstmt
 		static

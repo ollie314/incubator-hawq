@@ -50,6 +50,7 @@
 #include "utils/guc.h"
 
 #include "gpos/base.h"
+#include "gpos/error/CException.h"
 #undef setstate
 
 #include "gpos/_api.h"
@@ -177,6 +178,37 @@ COptTasks::SOptContext::SOptContext()
 	m_fUnexpectedFailure(false),
 	m_szErrorMsg(NULL)
 {}
+
+//---------------------------------------------------------------------------
+//	@function:
+//		COptTasks::SOptContext::HandleError
+//
+//	@doc:
+//		If there is an error print as warning and throw GPOS_EXCEPTION to abort
+//		plan generation. Calling elog::ERROR will result in longjump and hence
+//		a memory leak.
+//---------------------------------------------------------------------------
+void
+COptTasks::SOptContext::HandleError
+	(
+	BOOL *pfUnexpectedFailure
+	)
+{
+	BOOL bhasError = false;
+	if (NULL != m_szErrorMsg)
+	{
+		bhasError = true;
+		elog(WARNING, "%s", m_szErrorMsg);
+	}
+	*pfUnexpectedFailure = m_fUnexpectedFailure;
+
+	// clean up context
+	Free(epinQuery, epinPlStmt);
+	if (bhasError)
+	{
+		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiWarningAsError);
+	}
+}
 
 
 //---------------------------------------------------------------------------
@@ -358,7 +390,8 @@ COptTasks::SzAllocate
 	}
 	GPOS_CATCH_EX(ex)
 	{
-		elog(ERROR, "no available memory to allocate string buffer");
+		elog(WARNING, "no available memory to allocate string buffer");
+		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiWarningAsError);
 	}
 	GPOS_CATCH_END;
 
@@ -557,7 +590,21 @@ COptTasks::Execute
 	params.abort_requested = &abort_flag;
 
 	// execute task and send log message to server log
-	(void) gpos_exec(&params);
+	GPOS_TRY
+	{
+		(void) gpos_exec(&params);
+	}
+	GPOS_CATCH_EX(ex)
+	{
+		LogErrorAndDelete(err_buf);
+		GPOS_RETHROW(ex);
+	}
+	GPOS_CATCH_END;
+	LogErrorAndDelete(err_buf);
+}
+
+void
+COptTasks::LogErrorAndDelete(CHAR* err_buf) {
 
 	if ('\0' != err_buf[0])
 	{
@@ -726,9 +773,11 @@ COptTasks::PdrgPssLoad
 	}
 	GPOS_CATCH_EX(ex)
 	{
-		GPOS_RESET_EX;
-
+		if (GPOS_MATCH_EX(ex, gpdxl::ExmaGPDB, gpdxl::ExmiGPDBError)) {
+			GPOS_RETHROW(ex);
+		}
 		elog(DEBUG2, "\n[OPT]: Using default search strategy");
+		GPOS_RESET_EX;
 	}
 	GPOS_CATCH_END;
 
@@ -765,6 +814,7 @@ COptTasks::PoconfCreate
 	ULONG ulPartsToForceSortOnInsert =  (ULONG) optimizer_parts_to_force_sort_on_insert;
 	ULONG ulJoinArityForAssociativityCommutativity =  (ULONG) optimizer_join_arity_for_associativity_commutativity;
 	ULONG ulArrayExpansionThreshold =  (ULONG) optimizer_array_expansion_threshold;
+	ULONG ulJoinOrderThreshold = (ULONG) optimizer_join_order_threshold;
 
 	return GPOS_NEW(pmp) COptimizerConfig
 						(
@@ -772,9 +822,13 @@ COptTasks::PoconfCreate
 						GPOS_NEW(pmp) CStatisticsConfig(pmp, dDampingFactorFilter, dDampingFactorJoin, dDampingFactorGroupBy),
 						GPOS_NEW(pmp) CCTEConfig(ulCTEInliningCutoff),
 						pcm,
-						GPOS_NEW(pmp) CHint(ulPartsToForceSortOnInsert /* optimizer_parts_to_force_sort_on_insert */,
-										ulJoinArityForAssociativityCommutativity,
-										ulArrayExpansionThreshold)
+						GPOS_NEW(pmp) CHint
+								(
+								ulPartsToForceSortOnInsert /* optimizer_parts_to_force_sort_on_insert */,
+								ulJoinArityForAssociativityCommutativity,
+								ulArrayExpansionThreshold,
+								ulJoinOrderThreshold
+								)
 						);
 }
 
@@ -1528,13 +1582,6 @@ COptTasks::PvEvalExprFromDXLTask
 		{
 			CMDCache::Shutdown();
 		}
-		// Catch GPDB exceptions
-		if (GPOS_MATCH_EX(ex, gpdxl::ExmaGPDB, gpdxl::ExmiGPDBError))
-		{
-			elog(NOTICE, "Found non const expression. Please check log for more information.");
-			GPOS_RESET_EX;
-			return NULL;
-		}
 		if (FErrorOut(ex))
 		{
 			IErrorContext *perrctxt = CTask::PtskSelf()->Perrctxt();
@@ -1616,17 +1663,17 @@ COptTasks::PplstmtOptimize
 	SOptContext octx;
 	octx.m_pquery = pquery;
 	octx.m_fGeneratePlStmt= true;
-	Execute(&PvOptimizeTask, &octx);
-
-	if (NULL != octx.m_szErrorMsg)
+	GPOS_TRY
 	{
-		elog(ERROR, octx.m_szErrorMsg);
+		Execute(&PvOptimizeTask, &octx);
 	}
-	*pfUnexpectedFailure = octx.m_fUnexpectedFailure;
-
-	// clean up context
-	octx.Free(octx.epinQuery, octx.epinPlStmt);
-
+	GPOS_CATCH_EX(ex)
+	{
+		octx.HandleError(pfUnexpectedFailure);
+		GPOS_RETHROW(ex);
+	}
+	GPOS_CATCH_END;
+	octx.HandleError(pfUnexpectedFailure);
 	return octx.m_pplstmt;
 }
 
@@ -1838,8 +1885,9 @@ COptTasks::UlCmpt
 			return rgcmpt[ul];
 		}
 	}
-	
-	elog(ERROR, "Invalid comparison type code. Valid values are Eq, NEq, LT, LEq, GT, GEq");
+
+	elog(WARNING, "Invalid comparison type code. Valid values are Eq, NEq, LT, LEq, GT, GEq");
+	GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiWarningAsError);
 	return CmptOther;
 }
 
